@@ -1,0 +1,14 @@
+{
+  "name": "student-brain-poc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "retrieve:test": "node scripts/runRetrieval.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.104.0",
+    "dotenv": "^17.4.2",
+    "openai": "^6.34.0"
+  }
+}
