@@ -34,7 +34,7 @@ For the OpenAI-enhanced flow, both `short_term_memories` and `long_term_memories
 - `resonance_score`
 - `cultural_stickiness_score`
 - `last_seen_at`
-- `is_active`
+- `is_active` or a `memory_state` value included in `RETRIEVAL_ACTIVE_STATES`
 - `embedding` (optional; if absent or null, the PoC computes embeddings on the fly)
 
 ## Retrieval flow
@@ -43,4 +43,5 @@ For the OpenAI-enhanced flow, both `short_term_memories` and `long_term_memories
 2. Build a query string from the caption input context.
 3. Use OpenAI embeddings to measure semantic similarity between the input and each memory.
 4. Blend semantic match with recency and cultural score fields.
-5. Return the top memories as a JSON packet.
+5. Enforce a short-term/long-term memory balance in the final selection.
+6. Return the top memories as a JSON packet.

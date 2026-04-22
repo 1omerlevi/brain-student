@@ -23,34 +23,67 @@ const BASE_FIELDS = [
 const SELECT_WITH_EMBEDDING = [...BASE_FIELDS, "embedding"].join(", ");
 const SELECT_WITHOUT_EMBEDDING = BASE_FIELDS.join(", ");
 
-async function fetchCandidatesFromTable(tableName, limit) {
+function getActiveStates() {
+  return getOptionalEnv("RETRIEVAL_ACTIVE_STATES", "active,current,emerging")
+    .split(",")
+    .map((state) => state.trim())
+    .filter(Boolean);
+}
+
+async function runCandidateQuery(tableName, limit, selectClause, activeStates) {
   const supabase = getSupabaseClient();
-  let query = supabase
+
+  return supabase
     .from(tableName)
-    .select(SELECT_WITH_EMBEDDING)
+    .select(selectClause)
+    .eq("is_active", true)
+    .in("memory_state", activeStates)
     .order("last_seen_at", { ascending: false })
     .limit(limit);
+}
 
-  let { data, error } = await query;
+async function fetchCandidatesFromTable(tableName, limit) {
+  const activeStates = getActiveStates();
+  const selectVariants = [SELECT_WITH_EMBEDDING, SELECT_WITHOUT_EMBEDDING];
+  const queryStrategies = [
+    (selectClause) => runCandidateQuery(tableName, limit, selectClause, activeStates),
+    (selectClause) =>
+      getSupabaseClient()
+        .from(tableName)
+        .select(selectClause)
+        .eq("is_active", true)
+        .order("last_seen_at", { ascending: false })
+        .limit(limit),
+    (selectClause) =>
+      getSupabaseClient()
+        .from(tableName)
+        .select(selectClause)
+        .in("memory_state", activeStates)
+        .order("last_seen_at", { ascending: false })
+        .limit(limit),
+  ];
 
-  if (error && error.message.includes("embedding")) {
-    query = supabase
-      .from(tableName)
-      .select(SELECT_WITHOUT_EMBEDDING)
-      .order("last_seen_at", { ascending: false })
-      .limit(limit);
+  let data = null;
+  let error = null;
 
-    ({ data, error } = await query);
+  for (const selectClause of selectVariants) {
+    for (const queryStrategy of queryStrategies) {
+      ({ data, error } = await queryStrategy(selectClause));
+
+      if (!error) {
+        return (data || []).map((row) => ({
+          ...row,
+          source_table: tableName,
+        }));
+      }
+    }
   }
 
   if (error) {
     throw new Error(`Failed to fetch candidates from ${tableName}: ${error.message}`);
   }
 
-  return (data || []).map((row) => ({
-    ...row,
-    source_table: tableName,
-  }));
+  return [];
 }
 
 function hasStoredEmbedding(candidate) {
@@ -69,6 +102,41 @@ function formatMemoryPacket(scoredMemory, rank) {
     score_breakdown: scoredMemory.scoreBreakdown,
     source_table: scoredMemory.source_table,
   };
+}
+
+function selectBalancedMemories(shortTermScored, longTermScored, topK, limits) {
+  const totalCandidates = shortTermScored.length + longTermScored.length;
+  if (topK <= 0 || totalCandidates === 0) {
+    return [];
+  }
+
+  const availableShort = shortTermScored.length;
+  const availableLong = longTermScored.length;
+  const desiredShortWeight =
+    limits.shortTerm / Math.max(1, limits.shortTerm + limits.longTerm);
+  const shortTarget = Math.min(
+    availableShort,
+    Math.ceil(desiredShortWeight * topK)
+  );
+  const longTarget = Math.min(availableLong, Math.max(0, topK - shortTarget));
+
+  const selected = [
+    ...shortTermScored.slice(0, shortTarget),
+    ...longTermScored.slice(0, longTarget),
+  ];
+
+  if (selected.length < topK) {
+    const remaining = [
+      ...shortTermScored.slice(shortTarget),
+      ...longTermScored.slice(longTarget),
+    ].sort((left, right) => right.retrievalScore - left.retrievalScore);
+
+    selected.push(...remaining.slice(0, topK - selected.length));
+  }
+
+  return selected
+    .sort((left, right) => right.retrievalScore - left.retrievalScore)
+    .slice(0, topK);
 }
 
 export async function retrieveMemories(inputContext, options = {}) {
@@ -128,15 +196,34 @@ export async function retrieveMemories(inputContext, options = {}) {
     }))
     .sort((left, right) => right.retrievalScore - left.retrievalScore);
 
+  const scoredShortTerm = scoredCandidates.filter(
+    (candidate) => candidate.source_table === shortTermTable
+  );
+  const scoredLongTerm = scoredCandidates.filter(
+    (candidate) => candidate.source_table === longTermTable
+  );
+  const selectedCandidates = selectBalancedMemories(
+    scoredShortTerm,
+    scoredLongTerm,
+    limits.topK,
+    limits
+  );
+
   return {
     input_context: inputContext,
-    selected_memories: scoredCandidates
-      .slice(0, limits.topK)
-      .map((candidate, index) => formatMemoryPacket(candidate, index + 1)),
+    selected_memories: selectedCandidates.map((candidate, index) =>
+      formatMemoryPacket(candidate, index + 1)
+    ),
     retrieval_metadata: {
       candidate_count: candidates.length,
       short_term_count: shortTermCandidates.length,
       long_term_count: longTermCandidates.length,
+      selected_short_term_count: selectedCandidates.filter(
+        (candidate) => candidate.source_table === shortTermTable
+      ).length,
+      selected_long_term_count: selectedCandidates.filter(
+        (candidate) => candidate.source_table === longTermTable
+      ).length,
       openai_matching: {
         embedding_model: getOptionalEnv(
           "OPENAI_EMBEDDING_MODEL",
@@ -144,6 +231,7 @@ export async function retrieveMemories(inputContext, options = {}) {
         ),
         query_text: queryText,
       },
+      active_state_filter: getActiveStates(),
     },
   };
 }
